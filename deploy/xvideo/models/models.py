@@ -137,6 +137,9 @@ def _move_dit_to_device_lowvram(model: torch.nn.Module, device: torch.device) ->
                 f"({time.time() - started:.1f}s)"
             )
     if device.type == "cuda":
+        from xvideo.blockswap import maybe_enable_block_streaming
+
+        maybe_enable_block_streaming(model)
         torch.cuda.empty_cache()
         free_b, total_b = torch.cuda.mem_get_info(device)
         logger.info(
@@ -144,6 +147,51 @@ def _move_dit_to_device_lowvram(model: torch.nn.Module, device: torch.device) ->
             f"device used {(total_b - free_b) / 2**30:.1f}/{total_b / 2**30:.1f} GiB"
         )
     return model
+
+
+def _meta_init_enabled() -> bool:
+    return os.environ.get("JOYOMNI_DIT_META_INIT", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_dit_meta_assign(cfg, state_dict: dict, dtype: torch.dtype) -> torch.nn.Module:
+    """Build the DiT on the meta device and adopt the (mmap'd) checkpoint tensors
+    in place with load_state_dict(assign=True).
+
+    The regular path materializes the model on CPU first; FeedForward ignores
+    the dtype argument, so the MLPs (~2/3 of the weights) are allocated in fp32
+    and the DiT alone peaks at ~55 GB of host RAM before the bf16 cast. Here the
+    weights stay file-backed (page cache) until each block is staged to the GPU.
+    """
+    with torch.device("meta"):
+        model = Transformer3DModel(
+            dtype=dtype, device=torch.device("meta"), **_arch_params(cfg.dit_arch_config)
+        )
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=True, assign=True)
+    if missing_keys or unexpected_keys:
+        raise RuntimeError(f"meta-init DiT load: missing={missing_keys[:20]} unexpected={unexpected_keys[:20]}")
+    still_meta = [n for n, t in list(model.named_parameters()) + list(model.named_buffers()) if t.is_meta]
+    if still_meta:
+        raise RuntimeError(f"meta-init DiT load left tensors on meta: {still_meta[:20]}")
+    for param in model.parameters():
+        if param.dtype != dtype:
+            param.data = param.data.to(dtype)
+    return model
+
+
+def _img_in_weight_shape(cfg) -> tuple[int, ...]:
+    params = _arch_params(cfg.dit_arch_config)
+    patch = tuple(params.get("patch_size", (1, 2, 2)))
+    return (int(params["hidden_size"]), int(params["in_channels"]), *(int(p) for p in patch))
+
+
+def _inflate_img_in(state_dict: dict, target_shape: tuple[int, ...]) -> dict:
+    out = {}
+    for k, v in state_dict.items():
+        if k == "img_in.weight" and tuple(v.shape) != tuple(target_shape):
+            logger.info(f"Inflate {k} from {tuple(v.shape)} to {tuple(target_shape)}")
+            v = v.reshape(target_shape)
+        out[k] = v
+    return out
 
 
 def load_dit(cfg, device: torch.device) -> torch.nn.Module:
@@ -162,13 +210,6 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
             state_dict = state_dict["model"]
 
     dtype = PRECISION_TO_TYPE[cfg.dit_precision]
-    # Low-VRAM: build + fill on CPU, then stage blocks to the GPU as FP8 (the
-    # bf16 model alone would already overflow a 32GB card).
-    build_device = torch.device("cpu") if low_vram else device
-    model = Transformer3DModel(
-        dtype=dtype, device=build_device, **_arch_params(cfg.dit_arch_config)
-    )
-    model.to(device=build_device)
 
     if state_dict is not None:
         for prefix in ("model.", "module.", "transformer."):
@@ -178,22 +219,35 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
                     for k, v in state_dict.items()
                 }
 
-        load_state_dict = {}
-        for k, v in state_dict.items():
-            if (
-                k == "img_in.weight" and
-                hasattr(model, "img_in") and
-                model.img_in.weight.shape != v.shape
-            ):
-                logger.info(f"Inflate {k} from {v.shape} to {model.img_in.weight.shape}")
-                v = v.reshape_as(v.new_zeros(model.img_in.weight.shape))
-            load_state_dict[k] = v
+    model = None
+    if low_vram and state_dict is not None and _meta_init_enabled():
+        # Low-VRAM + meta init: no CPU materialization at all (see helper).
+        img_in_shape = _img_in_weight_shape(cfg)
+        state_dict = _inflate_img_in(state_dict, img_in_shape)
+        try:
+            model = _build_dit_meta_assign(cfg, state_dict, dtype)
+            logger.info("DiT built on meta device; checkpoint tensors adopted via mmap (JOYOMNI_DIT_META_INIT=1)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"meta-init DiT load failed ({exc!r}); falling back to the CPU build")
+            model = None
 
-        missing_keys, unexpected_keys = model.load_state_dict(load_state_dict, strict=True)
-        if missing_keys:
-            logger.warning(f"Missing keys when loading DiT: {missing_keys[:20]}")
-        if unexpected_keys:
-            logger.warning(f"Unexpected keys when loading DiT: {unexpected_keys[:20]}")
+    if model is None:
+        # Low-VRAM: build + fill on CPU, then stage blocks to the GPU as FP8 (the
+        # bf16 model alone would already overflow a 32GB card).
+        build_device = torch.device("cpu") if low_vram else device
+        model = Transformer3DModel(
+            dtype=dtype, device=build_device, **_arch_params(cfg.dit_arch_config)
+        )
+        model.to(device=build_device)
+
+        if state_dict is not None:
+            load_state_dict = _inflate_img_in(state_dict, tuple(model.img_in.weight.shape))
+            missing_keys, unexpected_keys = model.load_state_dict(load_state_dict, strict=True)
+            if missing_keys:
+                logger.warning(f"Missing keys when loading DiT: {missing_keys[:20]}")
+            if unexpected_keys:
+                logger.warning(f"Unexpected keys when loading DiT: {unexpected_keys[:20]}")
+    state_dict = None
 
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Instantiate model with {total_params / 1e9:.2f}B parameters")
@@ -205,6 +259,8 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
 
     if low_vram:
         model = _move_dit_to_device_lowvram(model, device_obj)
+    elif int(os.environ.get("JOYOMNI_DIT_OFFLOAD_BLOCKS", "0") or 0) > 0:
+        logger.warning("JOYOMNI_DIT_OFFLOAD_BLOCKS is ignored without JOYOMNI_LOW_VRAM=1")
 
     return model.eval()
 

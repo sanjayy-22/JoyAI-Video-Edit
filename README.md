@@ -148,6 +148,8 @@ http://localhost:8080
 
 The server binds `0.0.0.0:8080` by default — for remote machines, just open the port (or use SSH port forwarding).
 
+**RTX 4090 (24 GB):** build the kernels for `sm_89` and launch `bash deploy/run_server_4090.sh` instead. This profile streams part of the DiT from host RAM and has not yet been validated on real 4090 hardware. Steps: [`DEPLOYMENT.md` §5](DEPLOYMENT.md#5-rtx-4090-24-gb-ada-sm_89).
+
 ## 📚 Citation
 
 If JoyAI-Video-Edit is useful for your research or product prototype, please cite:
